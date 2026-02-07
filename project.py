@@ -1,37 +1,42 @@
+import time
+import random
+import math
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
+
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from statsmodels.datasets import airline
-import random
-import math
 
-# ======================
-# Reproducibility
-# ======================
+# =====================
+# Global Configuration
+# =====================
 SEED = 42
+SEQ_LEN = 12
+EPOCHS = 20
+NAS_TRIALS = 15
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# =====================
+# Dataset Utilities
+# =====================
+def load_dataset():
+    data = airline.load_pandas().data["passengers"].values.astype("float32")
+    scaler = MinMaxScaler()
+    data = scaler.fit_transform(data.reshape(-1, 1)).flatten()
+    return data, scaler
 
-# ======================
-# Dataset Preparation
-# ======================
-def load_time_series():
-    data = airline.load_pandas().data
-    series = data["passengers"].values.astype("float32")
-    return series
-
-def create_sequences(data, seq_len):
+def create_sequences(series, seq_len):
     X, y = [], []
-    for i in range(len(data) - seq_len):
-        X.append(data[i:i + seq_len])
-        y.append(data[i + seq_len])
+    for i in range(len(series) - seq_len):
+        X.append(series[i:i + seq_len])
+        y.append(series[i + seq_len])
     return np.array(X), np.array(y)
 
 class TimeSeriesDataset(Dataset):
@@ -45,31 +50,31 @@ class TimeSeriesDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
-# ======================
-# Model Definition
-# ======================
+# =====================
+# RNN Model
+# =====================
 class RNNModel(nn.Module):
-    def __init__(self, rnn_type, input_size, hidden_size, num_layers, dropout):
+    def __init__(self, rnn_type, hidden_size, num_layers, dropout):
         super().__init__()
 
         if rnn_type == "LSTM":
             self.rnn = nn.LSTM(
-                input_size,
-                hidden_size,
-                num_layers,
+                input_size=1,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
                 dropout=dropout if num_layers > 1 else 0,
                 batch_first=True
             )
         elif rnn_type == "GRU":
             self.rnn = nn.GRU(
-                input_size,
-                hidden_size,
-                num_layers,
+                input_size=1,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
                 dropout=dropout if num_layers > 1 else 0,
                 batch_first=True
             )
         else:
-            raise ValueError("Unsupported RNN type")
+            raise ValueError("Invalid RNN type")
 
         self.fc = nn.Linear(hidden_size, 1)
 
@@ -78,23 +83,21 @@ class RNNModel(nn.Module):
         out = out[:, -1, :]
         return self.fc(out).squeeze()
 
-# ======================
+# =====================
 # Training & Evaluation
-# ======================
-def train_model(model, loader, optimizer, criterion, epochs):
+# =====================
+def train(model, loader, optimizer, criterion):
     model.train()
-    for _ in range(epochs):
-        for X, y in loader:
-            X, y = X.to(DEVICE), y.to(DEVICE)
-            optimizer.zero_grad()
-            loss = criterion(model(X), y)
-            loss.backward()
-            optimizer.step()
+    for X, y in loader:
+        X, y = X.to(DEVICE), y.to(DEVICE)
+        optimizer.zero_grad()
+        loss = criterion(model(X), y)
+        loss.backward()
+        optimizer.step()
 
-def evaluate_model(model, loader):
+def evaluate(model, loader):
     model.eval()
     preds, targets = [], []
-
     with torch.no_grad():
         for X, y in loader:
             X = X.to(DEVICE)
@@ -105,97 +108,147 @@ def evaluate_model(model, loader):
     mae = mean_absolute_error(targets, preds)
     return rmse, mae
 
-# ======================
+# =====================
 # NAS Search Space
-# ======================
+# =====================
 SEARCH_SPACE = {
     "rnn_type": ["LSTM", "GRU"],
     "hidden_size": [32, 64, 128],
     "num_layers": [1, 2, 3],
     "dropout": [0.0, 0.2, 0.4],
-    "learning_rate": [1e-2, 1e-3, 5e-4],
+    "learning_rate": [0.01, 0.001, 0.0005],
     "batch_size": [16, 32, 64]
 }
 
 def sample_config():
     return {k: random.choice(v) for k, v in SEARCH_SPACE.items()}
 
-# ======================
-# NAS Engine (Random Search)
-# ======================
-def run_nas(train_data, val_data, input_size, trials=15):
-    best_score = float("inf")
+# =====================
+# NAS Engine
+# =====================
+def run_nas(train_ds, val_ds):
+    best_rmse = float("inf")
     best_config = None
+    total_time = 0
 
-    for trial in range(trials):
+    for i in range(NAS_TRIALS):
         config = sample_config()
-        print(f"\n🔍 Trial {trial + 1} | Config: {config}")
+        start = time.time()
 
         model = RNNModel(
             config["rnn_type"],
-            input_size,
             config["hidden_size"],
             config["num_layers"],
             config["dropout"]
         ).to(DEVICE)
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=config["learning_rate"]
+        )
+
+        train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=config["batch_size"])
         criterion = nn.MSELoss()
 
-        train_loader = DataLoader(train_data, batch_size=config["batch_size"], shuffle=True)
-        val_loader = DataLoader(val_data, batch_size=config["batch_size"])
+        for _ in range(EPOCHS):
+            train(model, train_loader, optimizer, criterion)
 
-        train_model(model, train_loader, optimizer, criterion, epochs=20)
-        rmse, mae = evaluate_model(model, val_loader)
+        rmse, mae = evaluate(model, val_loader)
+        elapsed = time.time() - start
+        total_time += elapsed
 
-        print(f"📊 RMSE: {rmse:.4f} | MAE: {mae:.4f}")
+        print(f"Trial {i+1:02d} | RMSE={rmse:.4f} | MAE={mae:.4f} | Time={elapsed:.2f}s")
 
-        if rmse < best_score:
-            best_score = rmse
+        if rmse < best_rmse:
+            best_rmse = rmse
             best_config = config
 
-    return best_config, best_score
+    print(f"\nNAS completed in {total_time:.2f}s")
+    return best_config
 
-# ======================
+# =====================
 # Main Pipeline
-# ======================
+# =====================
 def main():
-    series = load_time_series()
+    series, _ = load_dataset()
+    X, y = create_sequences(series, SEQ_LEN)
 
-    scaler = MinMaxScaler()
-    series_scaled = scaler.fit_transform(series.reshape(-1, 1)).flatten()
+    # 70 / 15 / 15 split
+    n = len(X)
+    train_end = int(0.7 * n)
+    val_end = int(0.85 * n)
 
-    SEQ_LEN = 12
-    X, y = create_sequences(series_scaled, SEQ_LEN)
+    X_train, y_train = X[:train_end], y[:train_end]
+    X_val, y_val = X[train_end:val_end], y[train_end:val_end]
+    X_test, y_test = X[val_end:], y[val_end:]
 
-    split = int(0.8 * len(X))
-    X_train, X_val = X[:split], X[split:]
-    y_train, y_val = y[:split], y[split:]
+    train_ds = TimeSeriesDataset(X_train, y_train)
+    val_ds = TimeSeriesDataset(X_val, y_val)
+    test_ds = TimeSeriesDataset(X_test, y_test)
 
-    train_dataset = TimeSeriesDataset(X_train, y_train)
-    val_dataset = TimeSeriesDataset(X_val, y_val)
-
-    # Baseline
-    print("\n📌 Training Baseline Model...")
-    baseline_model = RNNModel("LSTM", 1, 32, 1, 0.0).to(DEVICE)
-    optimizer = torch.optim.Adam(baseline_model.parameters(), lr=1e-3)
+    # =====================
+    # Baseline Model
+    # =====================
+    print("\nTraining baseline model...")
+    baseline = RNNModel("LSTM", 32, 1, 0.0).to(DEVICE)
+    optimizer = torch.optim.Adam(baseline.parameters(), lr=0.001)
     criterion = nn.MSELoss()
 
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32)
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=32)
 
-    train_model(baseline_model, train_loader, optimizer, criterion, epochs=20)
-    baseline_rmse, baseline_mae = evaluate_model(baseline_model, val_loader)
+    for _ in range(EPOCHS):
+        train(baseline, train_loader, optimizer, criterion)
 
-    print(f"📉 Baseline RMSE: {baseline_rmse:.4f}, MAE: {baseline_mae:.4f}")
+    baseline_rmse, baseline_mae = evaluate(baseline, test_loader)
 
-    # NAS
-    print("\n🚀 Starting Neural Architecture Search...")
-    best_config, best_rmse = run_nas(train_dataset, val_dataset, 1)
+    # =====================
+    # NAS Search
+    # =====================
+    print("\nStarting NAS search...")
+    best_config = run_nas(train_ds, val_ds)
 
-    print("\n🏆 Best Configuration Found:")
-    print(best_config)
-    print(f"Best RMSE: {best_rmse:.4f}")
+    # =====================
+    # Final Training (Train + Val)
+    # =====================
+    print("\nRetraining best NAS model on full training set...")
+    full_X = np.concatenate([X_train, X_val])
+    full_y = np.concatenate([y_train, y_val])
+    full_ds = TimeSeriesDataset(full_X, full_y)
+
+    final_model = RNNModel(
+        best_config["rnn_type"],
+        best_config["hidden_size"],
+        best_config["num_layers"],
+        best_config["dropout"]
+    ).to(DEVICE)
+
+    optimizer = torch.optim.Adam(
+        final_model.parameters(),
+        lr=best_config["learning_rate"]
+    )
+
+    full_loader = DataLoader(full_ds, batch_size=best_config["batch_size"], shuffle=True)
+
+    for _ in range(EPOCHS):
+        train(final_model, full_loader, optimizer, criterion)
+
+    nas_rmse, nas_mae = evaluate(final_model, test_loader)
+
+    # =====================
+    # Final Output
+    # =====================
+    print("\n========== FINAL RESULTS ==========")
+    print("Baseline Model:")
+    print(f"RMSE: {baseline_rmse:.4f}, MAE: {baseline_mae:.4f}\n")
+
+    print("NAS Optimized Model:")
+    print(f"RMSE: {nas_rmse:.4f}, MAE: {nas_mae:.4f}\n")
+
+    print("Winning NAS Configuration:")
+    for k, v in best_config.items():
+        print(f"{k}: {v}")
 
 if __name__ == "__main__":
     main()
